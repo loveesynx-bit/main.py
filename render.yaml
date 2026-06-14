@@ -1,12 +1,10 @@
 services:
   - type: web
     name: ig-notifier-backend
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
     plan: free
     envVars:
       - key: PORT
         value: "8000"
-      - key: PYTHON_VERSION
-        value: "3.11.9"
