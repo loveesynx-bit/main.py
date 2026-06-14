@@ -1,24 +1,34 @@
 """
 ╔══════════════════════════════════════════════════╗
-║  🤖 IG Notifier — Python Backend (FastAPI)      ║
-║  Deploy on Render.com / Railway / Heroku         ║
+║  🤖 IG Notifier — Python Backend (Fixed)        ║
+║  Deploy on Render.com with Python 3.11           ║
 ╚══════════════════════════════════════════════════
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from instagrapi import Client
-from instagrapi.exceptions import (
-    TwoFactorRequired, ChallengeRequired,
-    BadPassword, LoginRequired,
-    ConnectionException, SentryBlock,
-)
 import json
 import logging
 import os
+import traceback
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+
+# ── Safe instagrapi import ──
+try:
+    from instagrapi import Client as InstaClient
+    from instagrapi.exceptions import (
+        TwoFactorRequired, ChallengeRequired,
+        BadPassword, LoginRequired,
+        ConnectionException, SentryBlock,
+        GenericRequestError, BadCredentials,
+        PleaseWaitLoginPage, UserNotFound,
+    )
+    HAS_INSTAGRAPI = True
+except ImportError:
+    HAS_INSTAGRAPI = False
+    print("❌ instagrapi not installed!")
 
 # ══════════════════════════════════════════════════
 #  📝 LOGGING
@@ -83,14 +93,18 @@ class SessionRequest(BaseModel):
 # ══════════════════════════════════════════════════
 @app.post("/login")
 async def login(req: LoginRequest):
-    """Login to Instagram — handles 2FA detection"""
+    """Login to Instagram"""
+    if not HAS_INSTAGRAPI:
+        return {"status": "error", "error": "instagrapi not installed on server"}
+
     try:
-        cl = Client()
+        cl = InstaClient()
         cl.set_locale("en_US")
         cl.set_timezone_offset(19800)
 
-        # Try existing session first
         session_file = f"session_{req.username}.json"
+
+        # Try existing session
         if os.path.exists(session_file):
             try:
                 cl.load_settings(session_file)
@@ -103,8 +117,9 @@ async def login(req: LoginRequest):
                     "session_id": req.session_id,
                     "message": "Login successful (session)"
                 }
-            except Exception:
-                cl = Client()
+            except Exception as e:
+                logger.info(f"Session expired: {e}")
+                cl = InstaClient()
                 cl.set_locale("en_US")
                 cl.set_timezone_offset(19800)
                 try:
@@ -123,8 +138,8 @@ async def login(req: LoginRequest):
                 "session_id": req.session_id,
                 "message": "Login successful"
             }
+
         except TwoFactorRequired as e:
-            # 2FA required — store client and ask for OTP
             clients[req.session_id] = cl
             info = {}
             method = "unknown"
@@ -150,7 +165,6 @@ async def login(req: LoginRequest):
 
         except ChallengeRequired as e:
             clients[req.session_id] = cl
-            # Try auto-resolve
             try:
                 cl.challenge_resolve(cl.last_json)
                 cl.dump_settings(session_file)
@@ -171,32 +185,29 @@ async def login(req: LoginRequest):
             }
 
         except BadPassword:
-            return {
-                "status": "error",
-                "error": "Wrong password!"
-            }
+            return {"status": "error", "error": "Wrong password!"}
+
+        except BadCredentials:
+            return {"status": "error", "error": "Invalid username or password!"}
+
+        except UserNotFound:
+            return {"status": "error", "error": "Username not found!"}
+
+        except PleaseWaitLoginPage as e:
+            return {"status": "error", "error": f"Rate limited. Please wait: {e}"}
 
         except SentryBlock:
-            return {
-                "status": "error",
-                "error": "IP blocked by Instagram. Try proxy/different network."
-            }
+            return {"status": "error", "error": "IP blocked by Instagram. Try proxy."}
 
         except ConnectionException:
-            return {
-                "status": "error",
-                "error": "Cannot connect to Instagram."
-            }
+            return {"status": "error", "error": "Cannot connect to Instagram."}
 
         except Exception as e:
-            logger.error(f"❌ Login error: {e}")
-            return {
-                "status": "error",
-                "error": f"{type(e).__name__}: {str(e)}"
-            }
+            logger.error(f"❌ Login error: {e}\n{traceback.format_exc()}")
+            return {"status": "error", "error": f"{type(e).__name__}: {str(e)}"}
 
     except Exception as e:
-        logger.error(f"❌ Outer login error: {e}")
+        logger.error(f"❌ Outer error: {e}")
         return {"status": "error", "error": str(e)}
 
 
@@ -217,23 +228,30 @@ async def verify_2fa(req: Verify2FARequest):
         cl.two_factor_login(code)
         username = getattr(cl, 'username', 'unknown') or 'unknown'
         cl.dump_settings(f"session_{username}.json")
-        logger.info(f"✅ 2FA done: @{username}")
+        logger.info(f"✅ 2FA done (method 1): @{username}")
         return {"status": "ok", "message": "2FA verified"}
     except Exception as e:
         logger.debug(f"Method 1 failed: {e}")
 
-    # Method 2: login with verification_code
+    # Method 2: Re-login with verification_code
     try:
         last_json = getattr(cl, 'last_json', {}) or {}
-        username = last_json.get("username", "")
-        password = last_json.get("password", "")
-        if username and password:
-            cl_new = Client()
-            cl_new.login(username, password, verification_code=code)
-            cl_new.dump_settings(f"session_{username}.json")
-            clients[req.session_id] = cl_new
-            logger.info(f"✅ 2FA done (re-login): @{username}")
-            return {"status": "ok", "message": "2FA verified"}
+        stored_username = ""
+        # Try to find username from stored info
+        for sid, c in clients.items():
+            if c == cl:
+                try:
+                    stored_username = getattr(c, 'username', '') or ''
+                except Exception:
+                    pass
+                break
+
+        if stored_username:
+            cl_new = InstaClient()
+            cl_new.set_locale("en_US")
+            cl_new.set_timezone_offset(19800)
+            # We need password — but we don't store it
+            # Skip this method if we can't get credentials
     except Exception as e:
         logger.debug(f"Method 2 failed: {e}")
 
@@ -257,7 +275,7 @@ async def verify_2fa(req: Verify2FARequest):
             if result:
                 username = getattr(cl, 'username', 'unknown') or 'unknown'
                 cl.dump_settings(f"session_{username}.json")
-                logger.info(f"✅ 2FA done (direct): @{username}")
+                logger.info(f"✅ 2FA done (direct API): @{username}")
                 return {"status": "ok", "message": "2FA verified"}
     except Exception as e:
         logger.debug(f"Method 3 failed: {e}")
@@ -280,7 +298,10 @@ async def verify_2fa(req: Verify2FARequest):
     except Exception as e:
         logger.debug(f"Method 4 failed: {e}")
 
-    return {"status": "error", "error": "OTP verification failed. Try new code."}
+    return {
+        "status": "error",
+        "error": "OTP verification failed. Try new code or /start again."
+    }
 
 
 # ══════════════════════════════════════════════════
@@ -316,7 +337,6 @@ async def notifications(req: SessionRequest):
 
             ts = item.get("timestamp", item.get("created_at", ""))
 
-            # Ban check
             text_lower = str(text).lower()
             is_ban = any(kw in text_lower for kw in BAN_KEYWORDS)
             noti_type = str(item.get("type", "")).lower()
@@ -334,63 +354,60 @@ async def notifications(req: SessionRequest):
         except Exception:
             return None
 
-    # Endpoint 1: notifications/inbox
+    # Endpoint 1
     try:
         result = cl.private_request("notifications/inbox/", params={"mark_as_seen": "false"})
         items = result.get("notifications", result.get("items", []))
         for item in items:
             if isinstance(item, dict):
                 noti = parse_item(item)
-                if noti:
-                    all_notis.append(noti)
+                if noti: all_notis.append(noti)
     except Exception as e:
-        logger.debug(f"notifications/inbox error: {e}")
+        logger.debug(f"notifications/inbox: {e}")
 
-    # Endpoint 2: news/inbox
+    # Endpoint 2
     try:
         result = cl.private_request("news/inbox/", params={"mark_as_seen": "false"})
         items = result.get("items", result.get("notifications", []))
         for item in items:
             if isinstance(item, dict):
                 noti = parse_item(item)
-                if noti:
-                    all_notis.append(noti)
+                if noti: all_notis.append(noti)
     except Exception as e:
-        logger.debug(f"news/inbox error: {e}")
+        logger.debug(f"news/inbox: {e}")
 
-    # Endpoint 3: news
+    # Endpoint 3
     try:
         result = cl.private_request("news/", params={"mark_as_seen": "false"})
         items = result.get("items", [])
         for item in items:
             if isinstance(item, dict):
                 noti = parse_item(item)
-                if noti:
-                    all_notis.append(noti)
+                if noti: all_notis.append(noti)
     except Exception as e:
-        logger.debug(f"news error: {e}")
+        logger.debug(f"news: {e}")
 
-    logger.info(f"📬 Fetched {len(all_notis)} notifications for session {req.session_id[:8]}...")
+    logger.info(f"📬 {len(all_notis)} notis for {req.session_id[:8]}")
     return {"status": "ok", "notifications": all_notis}
 
 
 # ══════════════════════════════════════════════════
-#  📊 ACCOUNT STATUS ENDPOINT
+#  📊 STATUS ENDPOINT
 # ══════════════════════════════════════════════════
 @app.post("/status")
-async def status(req: SessionRequest):
-    """Check if Instagram session is still valid"""
+async def status_check(req: SessionRequest):
+    """Check if session is alive"""
     cl = clients.get(req.session_id)
     if not cl:
-        return {"status": "error", "error": "No session found"}
+        return {"status": "ok", "alive": False, "error": "No session"}
 
     try:
-        user_id = cl.user_id
-        if user_id:
-            cl.user_info(user_id)
-            return {"status": "ok", "alive": True, "user_id": str(user_id)}
+        uid = cl.user_id
+        if uid:
+            cl.user_info(uid)
+            return {"status": "ok", "alive": True, "user_id": str(uid)}
     except LoginRequired:
-        return {"status": "ok", "alive": False, "error": "Session expired"}
+        return {"status": "ok", "alive": False, "error": "Expired"}
     except Exception as e:
         return {"status": "ok", "alive": True, "note": str(e)}
 
@@ -406,6 +423,7 @@ async def health():
         "status": "ok",
         "service": "IG Notifier Backend",
         "active_sessions": len(clients),
+        "instagrapi": HAS_INSTAGRAPI,
         "time": datetime.now().isoformat()
     }
 
